@@ -1,0 +1,363 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <addrspace.h>
+//#include <vm.h>
+#include <machine/spl.h>
+#include <machine/tlb.h>
+#include <vnode.h>
+#include <thread.h>
+// vm.h is included in addrspace.h already
+
+/*
+ * Note! If OPT_DUMBVM is set, as is the case until you start the VM
+ * assignment, this file is not compiled or linked or in any way
+ * used. The cheesy hack versions in dumbvm.c are used instead.
+ */
+
+#define DUMBVM_STACKPAGES    12
+
+struct addrspace *
+as_create(void)
+{
+	struct addrspace *as = kmalloc(sizeof(struct addrspace)); //two pages
+	if (as == NULL) {
+		return NULL;
+	}
+
+//	kprintf("as_create, pid: %d, as: 0x%x\n", curthread->t_pid, as);
+
+	// new vm structure
+
+	// initialize the page table
+	int i;
+	for (i = 0; i < PT_SIZE; i++) {
+		as->two_level_PT[i] = NULL;
+	}
+
+	// stack
+	as->as_stackbase = 0;
+	as->as_stacknpages = 0;
+
+	// heap
+	as->as_heap_start = 0;
+	as->as_heap_end = 0;
+	as->as_heapnpages = 0;
+
+	// code region 1
+	as->as_vbase1 = 0;
+	as->as_npages1 = 0;
+
+	// code region 2
+	as->as_vbase2 = 0;
+	as->as_npages2 = 0;
+
+	// segments
+	as->as_vnode = NULL;
+
+	return as;
+}
+
+int
+as_copy(struct addrspace *old, struct addrspace **ret)
+{
+	//	kprintf("copy \n");
+	struct addrspace *new;
+
+	int spl = splhigh();
+	new = as_create();
+	if (new == NULL) {
+		return ENOMEM;
+	}
+
+	/*
+	 * Write this.
+	 */
+
+	// copy the pointer for the two regions
+	new->as_vbase1 = old->as_vbase1;
+	new->as_npages1 = old->as_npages1;
+	new->as_region_permission1 = old->as_region_permission1;
+	new->as_vbase2 = old->as_vbase2;
+	new->as_npages2 = old->as_npages2;
+	new->as_region_permission2 = old->as_region_permission2;
+
+	// copy the stack 
+	new->as_stackbase = old->as_stackbase;
+	//kprintf("stack %d pages\n", old->as_stacknpages);
+	new->as_stacknpages = old->as_stacknpages;
+
+	// copy the heap
+	new->as_heap_start = old->as_heap_start;
+	new->as_heap_end = old->as_heap_end;
+	new->as_heapnpages = old->as_heapnpages;
+
+	// copy the segments
+	new->as_vnode = old->as_vnode;
+	VOP_INCREF(old->as_vnode);
+	memmove((void *) new->as_segments,
+		(const void *) old->as_segments, 2 * sizeof(struct segment));
+
+
+	assert(new->as_vbase1 != 0);
+	assert(new->as_vbase2 != 0);
+	assert(new->as_heap_start != 0);
+	assert(new->as_stackbase != 0);
+
+	// copy the page table and allocate one page for each entry
+	int i, j;
+	// master page table
+	for (i = 0; i < PT_SIZE; i++) {
+		if (old->two_level_PT[i] != NULL) {
+			// allocate space for second level page table
+			new->two_level_PT[i] = (struct page_table_entry *) kmalloc(sizeof(struct page_table_entry) * PT_SIZE);
+			if (new->two_level_PT[i] == NULL)
+				return ENOMEM;
+
+			// second level page table
+			for (j = 0; j < PT_SIZE; j++) {
+
+				if (old->two_level_PT[i][j].valid == 1) {
+
+					// do deep copy
+					new->two_level_PT[i][j].valid = 1;
+					new->two_level_PT[i][j].writeable = 1;
+					new->two_level_PT[i][j].swapped = 0;
+
+
+					int part1 = (i << 22) & FIRST_LEVEL_VPN;
+					int part2 = (j << 12) & SECOND_LEVEL_VPN;
+					int vbase = (part1 | part2 | 0);
+					paddr_t new_page = alloc_upages(vbase, new);
+					//kprintf("first index is %x, second index is %x, vbase is %x, paddr is %x \n", part1, part2, vbase, new_page);
+
+					if (new_page == 0)
+						return ENOMEM;
+
+					if (old->two_level_PT[i][j].swapped == 1) {// if the page has been swapped out, swap back in for deep copy
+						lock_acquire(coremap_lock);
+						//kprintf("as_copy: need to swap to copy: vaddr at %x", vbase);
+						if (free_ppages == 0) {
+							kprintf("I'm in as_copy and there's no more free pages, going to call swap!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+							swap_out_to_disk();
+						}
+						swap_in_from_disk(vbase, old); // swap the page back for the old addrspace
+
+						lock_release(coremap_lock);
+					}
+					// round the page up to the beginning of a trunk of memory of 4096
+					new_page &= PAGE_FRAME;
+					paddr_t old_page = old->two_level_PT[i][j].addr;
+
+					memmove((void *) PADDR_TO_KVADDR(new_page),
+						(const void *) PADDR_TO_KVADDR(old_page),
+						PAGE_SIZE);
+
+					new->two_level_PT[i][j].addr = new_page;
+
+				} else {
+					// the page is not valid, do not copy
+					new->two_level_PT[i][j].valid = 0;
+				}
+			}
+		} else {
+			new->two_level_PT[i] = NULL;
+			//kprintf("copy: invalid first level PT in parent PT[%d] \n", i);
+		}
+	}
+	//	kprintf("finished copying \n");
+//	kprintf("as_copy finished, pid: %d\n", curthread->t_pid);
+
+	*ret = new;
+	splx(spl);
+	return 0;
+
+}
+
+void
+as_destroy(struct addrspace *as)
+{
+//		kprintf("as-destroy, pid: %d\n", curthread->t_pid);
+	/*
+	 * Clean up as needed.
+	 */
+	// clean up the page table
+	int i, j;
+	// master page table
+	for (i = 0; i < PT_SIZE; i++) {
+		if (as->two_level_PT[i] != NULL) {
+			// second level page table
+			for (j = 0; j < PT_SIZE; j++) {
+				//								// free the coremap entry if there's no more vaddr linked to the paddr
+				//								int k;
+				//								for (k = 0; k < page_num; k++) {
+				//									if (coremap[k].paddr == as->two_level_PT[i][j].addr&&coremap[k].as!=NULL) {
+				//										coremap[k].link--;
+				//										if (coremap[k].link == 0) {
+				//											coremap[i].ppage_state = 1;
+				//											coremap[k].as = NULL;
+				//											//                                                    coremap[k].vaddr = 0;
+				//											//                                                    coremap[k].paddr = 0;
+				//											//                                                    coremap[k].link = 0;
+				//											// actually free the memory space
+				//											kfree((paddr_t) as->two_level_PT[i][j].addr);
+				//											break;
+				//										}
+				//									}
+				//								}
+
+				if (as->two_level_PT[i][j].valid == 1) {
+					if (as->two_level_PT[i][j].swapped == 0) {
+						free_upages(as->two_level_PT[i][j].addr);
+					} else {
+						lock_acquire(coremap_lock);
+
+						// need to unmark the entry on the bitmap
+						int disk_idx = as->two_level_PT[i][j].addr / PAGE_SIZE;
+						assert(disk_idx < disk_page_num);
+						//kprintf("try to unmark: disk idx is %d \n", disk_idx);
+						bitmap_unmark(swap_map, disk_idx);
+						lock_release(coremap_lock);
+					}
+					as->two_level_PT[i][j].valid = 0;
+				}
+
+			}
+			// free the second level pointer
+			//			kprintf("pid: %d as_destroy second level:", curthread->t_pid);
+			kfree(as->two_level_PT[i]);
+		}
+	}
+
+	if (as->as_vnode)
+		VOP_DECREF(as->as_vnode);
+
+	//	kprintf("as_destroy as:");
+
+//	kprintf("as-destroy as to be freed, pid: %d, as: 0x%x\n", curthread->t_pid, as);
+
+	kfree(as);
+//	kprintf("as-destroy as finish, pid: %d, as: 0x%x\n", curthread->t_pid, as);
+
+}
+
+void
+as_activate(struct addrspace *as)
+{
+
+	int i, spl;
+
+	(void) as;
+
+	spl = splhigh();
+
+	for (i = 0; i < NUM_TLB; i++) {
+		TLB_Write(TLBHI_INVALID(i), TLBLO_INVALID(), i);
+	}
+
+	splx(spl);
+}
+
+/*
+ * Set up a segment at virtual address VADDR of size MEMSIZE. The
+ * segment in memory extends from VADDR up to (but not including)
+ * VADDR+MEMSIZE.
+ *
+ * The READABLE, WRITEABLE, and EXECUTABLE flags are set if read,
+ * write, or execute permission should be set on the segment. At the
+ * moment, these are ignored. When you write the VM system, you may
+ * want to implement them.
+ */
+int
+as_define_region(struct addrspace *as, vaddr_t vaddr, size_t sz,
+	int readable, int writeable, int executable, int *region)
+{
+	size_t npages;
+
+	/* Align the region. First, the base... */
+	sz += vaddr & ~(vaddr_t) PAGE_FRAME;
+	vaddr &= PAGE_FRAME;
+
+	/* ...and now the length. */
+	sz = (sz + PAGE_SIZE - 1) & PAGE_FRAME;
+
+	npages = sz / PAGE_SIZE;
+
+	/* We don't use these - all pages are read-write */
+	(void) readable;
+	(void) writeable;
+	(void) executable;
+
+	if (as->as_vbase1 == 0) {
+		as->as_vbase1 = vaddr;
+		as->as_npages1 = npages;
+		as->as_region_permission1 = 0 | (readable << 2) | (writeable << 1) | (executable);
+
+		as->as_heap_start = vaddr + npages * PAGE_SIZE;
+		as->as_heap_end = as->as_heap_start;
+
+		*region = REGION_1;
+		//kprintf("region 1 with page %d\n", npages);
+		return 0;
+	}
+
+	if (as->as_vbase2 == 0) {
+		as->as_vbase2 = vaddr;
+		as->as_npages2 = npages;
+		as->as_region_permission2 = 0 | (readable << 2) | (writeable << 1) | (executable);
+
+		as->as_heap_start = vaddr + npages * PAGE_SIZE;
+		as->as_heap_end = as->as_heap_start;
+
+		*region = REGION_2;
+		//kprintf("region 2 with page %d\n", npages);
+		return 0;
+	}
+
+	/*
+	 * Support for more than two regions is not available.
+	 */
+	//	kprintf("not dumb vm: Warning: too many regions\n");
+	return EUNIMP;
+}
+
+int
+as_prepare_load(struct addrspace *as)
+{
+	/*
+	 * Write this.
+	 */
+
+	(void) as;
+
+	return 0;
+}
+
+int
+as_complete_load(struct addrspace *as)
+{
+	/*
+	 * Write this.
+	 */
+
+	// should be setting permission here
+	(void) as;
+	return 0;
+}
+
+int
+as_define_stack(struct addrspace *as, vaddr_t *stackptr)
+{
+	/*
+	 * Write this.
+	 */
+
+	(void) as;
+
+	/* Initial user-level stack pointer */
+	as->as_stackbase = USERSTACK;
+	*stackptr = USERSTACK;
+
+	return 0;
+}
+

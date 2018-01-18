@@ -1,0 +1,960 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <uio.h>
+#include <elf.h>
+#include <vnode.h>
+#include <thread.h>
+#include <curthread.h>
+#include <addrspace.h>
+#include <vm.h>
+#include <synch.h>
+#include <machine/spl.h>
+#include <machine/tlb.h>
+#include <machine/trapframe.h>
+#include <machine/vm.h>
+#include <kern/unistd.h>
+#include <kern/stat.h>
+#include <vnode.h>
+#include <uio.h>
+
+/*
+ * Following functions are all modified from dumbvm.c
+ */
+
+
+int vm_init = 0;
+
+paddr_t coremap_startpaddr, coremap_endpaddr;
+
+void print_coremap(void){
+
+	int i = 0;
+	//kprintf("index|\t\tpaddr|\t\tppage_state|\tchunck_size|\tlink|\n");
+	//for( ; i < page_num; i++){
+	//	kprintf("%d|\t\t%d|\t\t%d|\t\t%d|\t\t%d|\n",
+	//			i, 
+	//			coremap[i].paddr,
+	//			coremap[i].ppage_state,
+	//			coremap[i].chunck_size,
+	//			coremap[i].link);
+	//}
+	//kprintf("index|\t\tpaddr|\t\tppage_state|\tchunck_size|\tlink|\n");
+	for( ; i < page_num; i++){
+		kprintf("i: %02d (%d)\t",
+				i, 
+				coremap[i].ppage_state);
+		if(i%5 == 0)
+			kprintf("\n");
+	}
+
+
+}
+
+
+void
+vm_bootstrap(void)
+{
+	int spl;
+
+	spl = splhigh();
+
+	paddr_t firstpaddr_temp, lastpaddr_temp;
+
+	ram_getsize(&firstpaddr_temp, &lastpaddr_temp);
+
+	// determine the size of coremap
+	unsigned long coremap_entry_num;
+	coremap = (struct coremap_entry*) PADDR_TO_KVADDR(firstpaddr_temp);
+
+	page_num = (lastpaddr_temp - firstpaddr_temp) / PAGE_SIZE;
+	free_ppages = page_num;
+	coremap_startpaddr = firstpaddr_temp;
+	coremap_endpaddr = firstpaddr_temp + page_num * sizeof(struct coremap_entry);
+	coremap_entry_num = ROUNDUP((coremap_endpaddr - firstpaddr_temp), PAGE_SIZE) / PAGE_SIZE;
+
+//	kprintf("free_ppages: %d, coremap_entry_num: %d\n", free_ppages, coremap_entry_num);
+
+	// initial setup of the coremap
+	unsigned long i = 0;
+	for( ; i<page_num; i++){
+		
+		if(i<coremap_entry_num){
+//			kprintf("coremap: stored address %x\n", firstpaddr_temp + i * PAGE_SIZE);
+			coremap[i].ppage_state = 0;
+			coremap[i].link = 1;
+			coremap[i].paddr = firstpaddr_temp + i * PAGE_SIZE;
+			coremap[i].vaddr = PADDR_TO_KVADDR(coremap[i].paddr);
+			coremap[i].as = NULL;
+			coremap[i].chunck_size = 1;
+			coremap[i].startpaddr = firstpaddr_temp;
+			free_ppages--;
+		}
+		else {
+	
+//			kprintf("free_ppages: %d, coremap_entry_num: %d\n", free_ppages, coremap_entry_num);
+			
+			coremap[i].ppage_state = 1;
+			coremap[i].link = 0;
+
+			//check correctness??
+			coremap[i].paddr = firstpaddr_temp + i * PAGE_SIZE;
+			coremap[i].vaddr = 0;
+			coremap[i].startpaddr = 0;
+			coremap[i].as = NULL;
+			coremap[i].chunck_size = 0;
+		}
+
+	}
+
+	vm_init = 1;
+		
+	coremap_lock = lock_create("coremap lock");
+
+	// initialize all the structures for page swapping
+	struct stat disk;
+	char* disk_name = {"lhd0raw:"};
+	
+	int result;
+
+	result = vfs_open(disk_name, O_RDWR, &disk_file);
+	if (result) {
+		panic("swap initialization failed \n");
+	}
+
+	// Return info about the disk in *disk. 
+	VOP_STAT(disk_file, &disk);
+
+	disk_page_num = disk.st_size / PAGE_SIZE;
+	swap_map = bitmap_create(disk_page_num);
+	
+	assert(swap_map != NULL);
+	
+	//kprintf("disk name is %s, number of page in the disk is %d \n", disk_name, disk_page_num);
+
+	splx(spl);
+}
+
+paddr_t
+getppages(unsigned long npages, vaddr_t vaddr, int is_kernel, struct addrspace *as)
+{
+
+//	kprintf("getppages: %d pages\n", npages);
+	paddr_t addr;
+
+	if (!vm_init) {
+
+		addr = ram_stealmem(npages);
+		return addr;
+	} else {
+
+		// get the next available n physical pages: currently without swap
+		unsigned long count = 0;
+		unsigned long chunck_start;
+
+		unsigned long i = 0;
+
+		lock_acquire(coremap_lock);
+		for (; i < page_num; i++) {
+
+			// get the first free page
+			if (coremap[i].ppage_state != 1) {
+
+				chunck_start = i + 1;
+				count = 0;
+				continue;
+			}
+
+			count++;
+
+			if (count == npages)
+				break;
+		}
+
+		// swap
+		if (i == page_num) {
+			chunck_start = getppages_k_swap(npages);
+			//lock_release(coremap_lock);
+			//return 0;
+		}
+
+		addr = coremap[chunck_start].paddr;
+		// how to synch with PT???
+		// set mapping in the coremap
+		for (i = chunck_start; i < chunck_start + npages; i++) {
+
+			assert(coremap[i].ppage_state == 1);
+			coremap[i].as = as; //check??? && when to store the vaddr?
+			coremap[i].link++;
+			//kprintf("getppages: new link at index %d is %d", i, coremap[i].link);
+
+			if(is_kernel){
+				//kprintf("got a kernel page \n");
+				coremap[i].vaddr = PADDR_TO_KVADDR(addr);
+				coremap[i].ppage_state = 0;
+			}else{
+				//kprintf("got a user page \n");
+				coremap[i].vaddr = vaddr;
+				coremap[i].ppage_state = 2;
+			}
+			coremap[i].chunck_size = npages;
+			coremap[i].startpaddr = addr;
+			free_ppages--;
+			//coremap[i].paddr = coremap[i].startpaddr + (i - chunck_start) * PAGE_SIZE;
+		}
+
+		lock_release(coremap_lock);
+	}
+
+	//	kprintf("new page at paddr %04x \n", addr);
+	return addr;
+
+}
+
+/* Allocate/free some kernel-space virtual pages */
+vaddr_t
+alloc_kpages(int npages)
+{
+//	kprintf("alloc %d kpages\n",npages);
+	paddr_t pa;
+	pa = getppages(npages, NULL, 1, NULL);
+	if (pa == 0) {
+		return 0;
+	}
+	return PADDR_TO_KVADDR(pa);
+}
+
+paddr_t
+alloc_upages(vaddr_t addr, struct addrspace *as)
+{
+	paddr_t pa;
+	pa = getppages(1, addr, 0, as);
+	if (pa == 0) {
+		return 0;
+	}
+	return pa;
+}
+
+
+void
+free_kpages(vaddr_t addr)
+{
+
+
+	// find the corresponding ppage in coremap
+	lock_acquire(coremap_lock);
+
+	int i = (KVADDR_TO_PADDR(addr) - coremap_startpaddr) / PAGE_SIZE;
+	assert(KVADDR_TO_PADDR(addr) == coremap[i].paddr);
+	assert(coremap[i].chunck_size != 0);
+
+	int npage_to_free = coremap[i].chunck_size;
+
+
+	//if(i == page_num)
+	//???
+	// not sure: if free one of the pages in the chunck
+	// how to synch with PT???
+	if (coremap[i].paddr == coremap[i].startpaddr) {
+
+		unsigned long j;
+		for (j = i; j < i + npage_to_free; j++) {
+
+//			kprintf("coremap: free page at %08x \n", coremap[j].paddr);
+			coremap[j].as = NULL;
+			coremap[j].startpaddr = 0;
+			coremap[j].ppage_state = 1;
+			coremap[j].chunck_size = 0;
+			coremap[j].link--;
+			//kprintf("free_kpages: new link at index %d is %d", i, coremap[i].link);
+			assert(coremap[j].link >= 0);
+			free_ppages++;
+
+		}
+
+	} else {
+
+		coremap[i].as = NULL;
+		coremap[i].startpaddr = 0;
+		coremap[i].ppage_state = 1;
+		coremap[i].chunck_size = 0;
+		free_ppages++;
+	}
+
+//	kprintf("kfree: remaining %d\n", free_ppages);
+	//print_coremap();
+
+	lock_release(coremap_lock);
+}
+
+void 
+free_upages(paddr_t addr){
+
+	lock_acquire(coremap_lock);
+
+//	kprintf("addr is %08x \n",addr);
+//	kprintf("coremap_startpaddr is %08x \n",coremap_startpaddr);
+	int index = (addr-coremap_startpaddr) / PAGE_SIZE;
+//	kprintf("idx is %d \n", index);
+	assert(addr == coremap[index].paddr);
+//	if(coremap[index].as != curthread->t_vmspace){
+//		kprintf("coremap.as = 0x%x, cur.as = 0x%x, cur.pid = %d\n\n", 
+//			coremap[index].as, curthread->t_vmspace, curthread->t_pid);
+//	}
+	//assert(coremap[index].as == curthread->t_vmspace);
+	
+//	if(coremap[index].chunck_size != 1){
+//		kprintf("chunck size is %d", coremap[index].chunck_size);
+//	}
+
+	coremap[index].link--;
+	//kprintf("free_upages: new link at index %d is %d by as at %x", index, coremap[index].link, coremap[index].as);
+	//assert(coremap[index].link >= 0);
+
+	if (coremap[index].link <= 0) {
+
+//		kprintf("coremap: free page at %08x \n", addr);
+		// if copy-on-write, how to keep track of remaining as??????
+		coremap[index].as = NULL;
+		coremap[index].startpaddr = 0;
+		coremap[index].ppage_state = 1;
+		coremap[index].chunck_size = 0;
+		free_ppages++;
+	}
+
+//	kprintf("ufree: remaining %d\n", free_ppages);
+
+	lock_release(coremap_lock);
+}
+
+paddr_t 
+page_fault_handler(vaddr_t faultaddress, 
+		struct addrspace *as, int permission)
+{
+
+	int first_index = (faultaddress & FIRST_LEVEL_VPN) >> 22; 
+	int second_index = (faultaddress & SECOND_LEVEL_VPN) >> 12;
+
+
+	struct page_table_entry *second_PT = as->two_level_PT[first_index];
+
+	// request a ppage 
+	paddr_t paddr = alloc_upages(faultaddress, as);
+
+	// if cannot alloc more pages, swapping; change when swapping works
+	if(paddr == 0)
+		return ENOMEM;
+
+	// set mapping in page table
+	second_PT[second_index].addr = paddr & PAGE_FRAME;
+	second_PT[second_index].valid = 1;
+	second_PT[second_index].writeable = 1;
+			
+
+	return (paddr & PAGE_FRAME);
+}
+
+
+int 
+load_page(vaddr_t faultaddress, 
+		struct addrspace *as, int region, int permission)
+{
+
+	struct vnode *v = as->as_vnode;
+	struct segment as_segment;
+	int pages;
+	off_t offset;
+	vaddr_t vaddr;
+	size_t memsize;
+	size_t residue;
+	int is_executable;
+	vaddr_t vbase;
+
+	struct uio u;
+	int result;
+	size_t fillamt;
+
+
+	if(as->as_segments[0].region == region)
+		as_segment = as->as_segments[0];
+	else if(as->as_segments[1].region == region)
+		as_segment = as->as_segments[1];
+
+	//assert(as_segment == as->as_segments[0] || as_segment == as->as_segments[1]);
+
+	if(region == REGION_1)
+		vbase = as->as_vbase1;
+	else if(region == REGION_2)
+		vbase = as->as_vbase2;
+
+	
+	pages = (faultaddress - vbase) / PAGE_SIZE;
+	offset = as_segment.p_offset + faultaddress - vbase;
+	vaddr = faultaddress;
+	memsize = PAGE_SIZE;
+	is_executable = as_segment.p_flags;
+
+
+	if((faultaddress - vbase) > as_segment.p_filesz)
+		residue = 0;
+	else if((pages + 1) * PAGE_SIZE < as_segment.p_filesz)
+		residue = PAGE_SIZE;
+	else
+		residue = vbase + as_segment.p_filesz - faultaddress;
+
+
+//	if (filesize > memsize) {
+//		kprintf("ELF: warning: segment filesize > segment memsize\n");
+//		filesize = memsize;
+//	}
+//
+//	DEBUG(DB_EXEC, "ELF: Loading %lu bytes to 0x%lx\n",
+//		(unsigned long) filesize, (unsigned long) vaddr);
+
+	u.uio_iovec.iov_ubase = (userptr_t) vaddr;
+	u.uio_iovec.iov_len = memsize; // length of the memory space
+	u.uio_resid = residue; // amount to actually read
+	u.uio_offset = offset;
+	u.uio_segflg = is_executable ? UIO_USERISPACE : UIO_USERSPACE;
+	u.uio_rw = UIO_READ;
+	u.uio_space = curthread->t_vmspace;
+
+	result = VOP_READ(v, &u);
+	if (result) {
+		return result;
+	}
+
+	if (u.uio_resid != 0) {
+		/* short read; problem with executable? */
+		//kprintf("ELF: short read on segment - file truncated?\n");
+		return ENOEXEC;
+	}
+
+	/* Fill the rest of the memory space (if any) with zeros */
+	fillamt = memsize - residue;
+	if (fillamt > 0) {
+		DEBUG(DB_EXEC, "ELF: Zero-filling %lu more bytes\n",
+			(unsigned long) fillamt);
+		u.uio_resid += fillamt;
+		result = uiomovezeros(fillamt, &u);
+	}
+
+	return result;
+}
+
+
+/* Check validity of the vaddr
+ * 1. if exist in page table, load into TLB
+ * 2. if triger a page fault, allocate physical page for it and set mapping in PT and TLB
+ * 3. if no space in physical mem, swap and then set mapping in coremap, PT and TLB
+ *
+ * 2 and 3 is implemented in page_fault_handler
+ *
+ * the swapping is not implemented until part 3
+ */
+int 
+check_vaddr(int faulttype, vaddr_t faultaddress, 
+		struct addrspace *as, int region, int permission) 
+{
+
+	int first_index = (faultaddress & FIRST_LEVEL_VPN) >> 22;
+	int second_index = (faultaddress & SECOND_LEVEL_VPN) >> 12;	
+
+
+	paddr_t paddr;
+
+	int i;
+	int result;
+	u_int32_t ehi, elo;
+
+	int pte_writeable;
+	struct page_table_entry *second_PT = as->two_level_PT[first_index];
+
+	// the address for read must be valid
+	
+	/*if(faulttype == VM_FAULT_READ){
+
+		if(second_PT == NULL || second_PT[second_index].valid == 0)
+			return EFAULT;
+
+		if (second_PT[second_index].swapped == 1) {
+			// if the page has been swapped out, read it from the disk
+			lock_acquire(coremap_lock);
+			if (free_ppages == 0) {
+				swap_out_to_disk();
+			}
+			swap_in_from_disk(faultaddress, as);
+			lock_release(coremap_lock);
+		}
+		paddr = (paddr_t) second_PT[second_index].addr;
+		pte_writeable = second_PT[second_index].writeable;
+
+	}
+	// the first level page table should be allocated when as_copy, all NULL and valid bit to 0
+	// for writing to the address that is invalid in TLB
+	else*/ 
+	if(faulttype == VM_FAULT_WRITE || faulttype == VM_FAULT_READ) {
+
+		// second level page table does not exist, allocate one
+		if (second_PT == NULL) {
+
+			second_PT = (struct page_table_entry *) kmalloc(PT_SIZE * sizeof(struct page_table_entry));
+			if(second_PT == NULL)
+				return ENOMEM;
+
+			// invalidate all entries
+			for (i = 0; i < PT_SIZE; i++){
+				second_PT[i].valid = 0;
+				second_PT[i].swapped = 0;
+				second_PT[i].writeable = 0;
+				second_PT[i].addr = NULL;
+			}
+			as->two_level_PT[first_index] = second_PT;
+
+			paddr = page_fault_handler(faultaddress, as, permission);
+			if(region == REGION_STACK)
+				as->as_heapnpages++;
+			if(region == REGION_1){
+				result = load_page(faultaddress, as, REGION_1, permission);
+				return result;
+			}
+			if(region == REGION_2){
+				result = load_page(faultaddress, as, REGION_2, permission);
+				return result;
+			}
+
+
+			pte_writeable = 1;
+
+		}// if there is no mapping in existing page table
+		else if (second_PT[second_index].valid == 0) {
+
+			paddr = page_fault_handler(faultaddress, as, permission);
+			if(region == REGION_STACK)
+				as->as_heapnpages++;
+			if(region == REGION_1){
+				result = load_page(faultaddress, as, REGION_1, permission);
+				return result;
+			}
+			if(region == REGION_2){
+				result = load_page(faultaddress, as, REGION_2, permission);
+				return result;
+			}
+
+
+			pte_writeable = 1;
+
+		}// if the page has been swapped out
+		else if (second_PT[second_index].swapped == 1) {
+			lock_acquire(coremap_lock);
+			// if there's no more free pages on the ram, swap out one randomly
+			if (free_ppages == 0) {
+				//kprintf("I'm in vm_fault and there's no more free pages, going to call swap!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+				swap_out_to_disk();
+			}
+			//kprintf("vm_fault: going to call swap in \n");
+			swap_in_from_disk(faultaddress, as);
+			lock_release(coremap_lock);
+			
+			paddr = (paddr_t) second_PT[second_index].addr;
+			pte_writeable = second_PT[second_index].writeable;
+
+		}// if the mapping is in the page table
+		else if (second_PT[second_index].writeable == 0) {
+
+			// copy-on-write, coremap link decrease
+			paddr_t old_paddr;
+			old_paddr = (paddr_t) second_PT[second_index].addr;
+
+
+			int index = (old_paddr - coremap_startpaddr) / PAGE_SIZE;
+
+			assert(old_paddr == coremap[index].paddr);
+			//coremap[index].link--;
+			//kprintf("checkvaddr, not writeable: new link at index %d is %d", i, coremap[i].link);
+
+			paddr = page_fault_handler(faultaddress, as, permission);
+			if(region == REGION_STACK)
+				as->as_heapnpages++;
+			if(region == REGION_1){
+				result = load_page(faultaddress, as, REGION_1, permission);
+				return result;
+			}
+			if(region == REGION_2){
+				result = load_page(faultaddress, as, REGION_2, permission);
+				return result;
+			}
+
+
+
+			pte_writeable = 1;
+
+		} else {
+
+			paddr = (paddr_t) second_PT[second_index].addr;
+			pte_writeable = second_PT[second_index].writeable;
+
+		}
+
+	}// writing to readonly address
+	else {
+
+		// copy-on-write, coremap link decrease
+		paddr_t old_paddr;
+		old_paddr = (paddr_t) second_PT[second_index].addr;
+
+
+		int index = (old_paddr - coremap_startpaddr) / PAGE_SIZE;
+
+		assert(old_paddr == coremap[index].paddr);
+		coremap[index].link--;
+		//kprintf("checkvaddr readonly: new link at index %d is %d", i, coremap[i].link);
+
+
+		paddr = page_fault_handler(faultaddress, as, permission);
+		if(region == REGION_STACK)
+			as->as_heapnpages++;
+		
+
+		pte_writeable = 1;
+
+	}
+
+	
+
+
+
+	/* make sure it's page-aligned */
+	//faultaddress &= PAGE_FRAME;
+	assert((paddr & PAGE_FRAME) == paddr);
+
+	for (i = 0; i < NUM_TLB; i++) {
+		TLB_Read(&ehi, &elo, i);
+		if (elo & TLBLO_VALID) {
+			continue;
+		}
+		ehi = faultaddress;
+
+		if (pte_writeable)
+			elo = paddr | TLBLO_DIRTY | TLBLO_VALID;
+		//else
+		//	elo = paddr | 0 | TLBLO_VALID;
+
+		DEBUG(DB_VM, "dumbvm: 0x%x -> 0x%x\n", faultaddress, paddr);
+		TLB_Write(ehi, elo, i);
+		return 0;
+	}
+
+	//kprintf("dumbvm: Ran out of TLB entries - cannot handle page fault\n");
+
+	ehi = faultaddress;
+	if (pte_writeable)
+		elo = paddr | TLBLO_DIRTY | TLBLO_VALID;
+	//else
+	//	elo = paddr | 0 | TLBLO_VALID;
+
+	TLB_Random(ehi, elo);
+	return 0;
+
+}
+
+int
+vm_fault(int faulttype, vaddr_t faultaddress)
+{
+	vaddr_t vbase1, vtop1, vbase2, vtop2;
+	vaddr_t stackbase, stacktop, heapbase, heaptop;
+
+	int result;
+
+
+	struct addrspace *as;
+	int spl;
+
+	spl = splhigh();
+
+	faultaddress &= PAGE_FRAME;
+
+	//DEBUG(DB_VM, "dumbvm: fault: 0x%x\n", faultaddress);
+
+	switch (faulttype) {
+	    case VM_FAULT_READONLY:
+		/* We always create pages read-write, so we can't get this */
+		    //comment out if implementing copy-on-write
+		panic("dumbvm: got VM_FAULT_READONLY\n");
+	    case VM_FAULT_READ:
+	    case VM_FAULT_WRITE:
+		break;
+	    default:
+		splx(spl);
+		return EINVAL;
+	}
+
+	as = curthread->t_vmspace;
+	if (as == NULL) {
+		/*
+		 * No address space set up. This is probably a kernel
+		 * fault early in boot. Return EFAULT so as to panic
+		 * instead of getting into an infinite faulting loop.
+		 */
+		splx(spl);
+		return EFAULT;
+	}
+
+	/* Assert that the address space has been set up properly. */
+	if(as->as_vbase1 == 0){
+		kprintf("vbase 1: %x", as->as_vbase1);
+		kprintf("vbase page 1: %d", as->as_npages1);
+		kprintf("vbase 2: %x", as->as_vbase2);
+		kprintf("vbase page 2: %d", as->as_npages2);
+	}
+	assert(as->as_npages1 != 0);
+	assert(as->as_vbase2 != 0);
+	assert(as->as_npages2 != 0);
+	//assert(as->as_stackbase != 0);
+
+
+
+	assert((as->as_vbase1 & PAGE_FRAME) == as->as_vbase1);
+	assert((as->as_vbase2 & PAGE_FRAME) == as->as_vbase2);
+	//assert((as->as_stackbase & PAGE_FRAME) == as->as_stackbase);
+
+	vbase1 = as->as_vbase1;
+	vtop1 = vbase1 + as->as_npages1 * PAGE_SIZE;
+	vbase2 = as->as_vbase2;
+	vtop2 = vbase2 + as->as_npages2 * PAGE_SIZE;
+	stackbase = USERSTACK - STACK_MAX * PAGE_SIZE;
+	stacktop = USERSTACK;
+	heapbase = as->as_heap_start;
+	heaptop = as->as_heap_end;
+
+	if (faultaddress >= vbase1 && faultaddress < vtop1) {
+
+		result = check_vaddr(faulttype, faultaddress, as, REGION_1, as->as_region_permission1);
+		splx(spl);
+		return result;
+	}
+	else if (faultaddress >= vbase2 && faultaddress < vtop2) {
+
+		result = check_vaddr(faulttype, faultaddress, as, REGION_2, as->as_region_permission2);
+		splx(spl);
+		return result;
+	}
+	else if (faultaddress >= stackbase && faultaddress < stacktop) {
+		
+		result = check_vaddr(faulttype, faultaddress, as, REGION_STACK, 0);
+		splx(spl);
+		return result;
+	}
+	else if (faultaddress >= heapbase && faultaddress < heaptop) {
+
+		result = check_vaddr(faulttype, faultaddress, as, REGION_HEAP, 0);
+		splx(spl);
+		return result;
+	}
+	else {
+		splx(spl);
+		return EFAULT;
+	}
+
+}
+
+/*
+ * the following two functions are for swapping page in and out from the disk
+ * 
+ * note: coremap lock must be acquired before entering those two functions!!!
+ * note: need to find a way to synchronize them, current plan: lock and cv
+ */
+// randomly choose a page from the disk to swap xixixixixixixixi
+
+void swap_out_to_disk()
+{
+	int swap_core_idx;
+
+	//kprintf("swap out!\n");
+	// only swap out dirty pages
+	while (1) {
+		swap_core_idx = random() % page_num;
+		//kprintf("swap out 2!\n");
+		// found a dirty core map entry
+		if (coremap[swap_core_idx].ppage_state == 2)
+			break;
+	}
+
+	//kprintf("swap out: index chosen is %d\n", swap_core_idx);
+	//kprintf("swap out: paddr chosen is %x\n", coremap[swap_core_idx].paddr);
+	
+	assert(coremap[swap_core_idx].ppage_state == 2);
+	assert((coremap[swap_core_idx].paddr & PAGE_FRAME) == coremap[swap_core_idx].paddr);
+
+	int disk_idx;
+	bitmap_alloc(swap_map, &disk_idx);
+	//kprintf("try to mark: disk idx is %d \n", disk_idx);
+	
+	if(disk_idx == 1279){
+		panic("no more space on disk!!\n");
+	}
+	assert(disk_idx < disk_page_num);
+
+	struct uio ku;
+	int result;
+	off_t disk_position = disk_idx * PAGE_SIZE;
+
+	//kprintf("swap out on disk location: %x, offset index is %d \n", disk_position, disk_idx);
+
+	/* Set up a uio to do the write */
+	mk_kuio(&ku, PADDR_TO_KVADDR(coremap[swap_core_idx].paddr), PAGE_SIZE, disk_position, UIO_WRITE);
+
+	result = VOP_WRITE(disk_file, &ku);
+	if (result) {
+		panic("swap out failed!!!");
+	}
+
+	//kprintf("swap out: vaddr chosen is %x\n", coremap[swap_core_idx].vaddr);
+	
+	// update PT entry for the page that is swapped out in the address space it belongs to
+	int first_index = (coremap[swap_core_idx].vaddr & FIRST_LEVEL_VPN) >> 22;
+	int second_index = (coremap[swap_core_idx].vaddr & SECOND_LEVEL_VPN) >> 12;
+
+	struct addrspace *as = coremap[swap_core_idx].as;
+	struct page_table_entry *second_PT = as->two_level_PT[first_index];
+
+	// set mapping in page table
+	second_PT[second_index].addr = disk_position;
+	second_PT[second_index].valid = 1;
+	second_PT[second_index].writeable = 0; //?
+	second_PT[second_index].swapped = 1;
+
+	// update the coremap entry
+	coremap[swap_core_idx].vaddr = 0;
+	coremap[swap_core_idx].ppage_state = 1;
+	coremap[swap_core_idx].as = NULL;
+	coremap[swap_core_idx].link = 0;
+	coremap[swap_core_idx].chunck_size = 0;
+	//coremap[swap_core_idx].startpaddr = 0;
+
+
+	free_ppages++;
+
+	// called in check_vaddr, so don't need to update tlb
+}
+
+// Restore the page that has been swapped out back from the disk
+
+void swap_in_from_disk(vaddr_t faultaddress, struct addrspace *as)
+{
+
+	// find the physical address (on disk) from the page table
+	int first_index = (faultaddress & FIRST_LEVEL_VPN) >> 22;
+	int second_index = (faultaddress & SECOND_LEVEL_VPN) >> 12;
+
+	struct page_table_entry *second_PT = as->two_level_PT[first_index];
+
+	
+	assert(second_PT[second_index].swapped == 1);
+
+	// find a empty entry on the coremap
+	int i = 0;
+	for (; i < page_num; i++) {
+		// get the first free page
+		if (coremap[i].ppage_state == 1) {
+			break;
+		}
+	}
+
+	if (i == page_num) {
+		panic("can't find a free entry to swap in!!!!");
+	}
+	paddr_t paddr_on_ram = coremap[i].paddr;
+	
+	//kprintf("swap in: index chosen is %d\n", i);
+	//kprintf("swap in: paddr chosen is %x\n", coremap[i].paddr);
+
+	assert(coremap[i].ppage_state == 1);
+
+	// actually read the page from the disk
+	struct uio ku;
+	int result;
+	int disk_idx;
+//	kprintf("0x%x & PAGE_FRAME = 0x%x", second_PT[second_index].addr, (second_PT[second_index].addr & PAGE_FRAME));
+	assert((second_PT[second_index].addr & PAGE_FRAME) == second_PT[second_index].addr);
+	disk_idx = (second_PT[second_index].addr & PAGE_FRAME) / PAGE_SIZE;
+	//kprintf("try to unmark: disk idx is %d \n", disk_idx);
+	bitmap_unmark(swap_map, disk_idx); // need to unmark?
+
+	assert(disk_idx < disk_page_num);
+
+	off_t disk_position = disk_idx * PAGE_SIZE;
+	assert(disk_position == second_PT[second_index].addr);
+	
+	//kprintf("swap in from disk location: %x, offset index is %d \n", disk_position, disk_idx);
+
+	/* Set up a uio to do the read */
+	mk_kuio(&ku, PADDR_TO_KVADDR(paddr_on_ram), PAGE_SIZE, disk_position, UIO_READ);
+
+	result = VOP_READ(disk_file, &ku);
+	if (result) {
+		panic("swap in failed!!!");
+	}
+
+	// update the coremap entry
+	coremap[i].ppage_state = 2;
+	coremap[i].as = as;
+	coremap[i].vaddr = faultaddress;
+	coremap[i].chunck_size = 1;
+	coremap[i].link = 1;
+	coremap[i].startpaddr = coremap[i].paddr;
+
+
+	// set mapping in page table
+	// store the physical address back and make the entry writable and not swapped
+	second_PT[second_index].addr = paddr_on_ram;
+	second_PT[second_index].valid = 1;
+	second_PT[second_index].writeable = 1;
+	second_PT[second_index].swapped = 0;
+
+	free_ppages--;
+
+	// called in check_vaddr, so don't need to update tlb
+}
+
+// using only this function at the moment, may change for better performance
+unsigned long getppages_k_swap(unsigned long npages)
+{
+	unsigned long chunck_start;
+	int found = 0;
+	
+	//kprintf("need to find %d pages by swapping! \n", npages);
+	
+	while (found == 0) {
+		unsigned long count = 0;
+		unsigned long i = 0;
+		
+		for (; i < page_num; i++) {
+
+			// get the first free page
+			if (coremap[i].ppage_state != 1) {
+
+				chunck_start = i + 1;
+				count = 0;
+				continue;
+			}
+
+			count++;
+
+			if (count == npages) {
+				found++;
+				break;
+			}
+		}
+		if (count < npages) {
+			//kprintf("swap!");
+			swap_out_to_disk();
+		}
+	}
+	//kprintf("getppages_swap: the new chunck start is %d", chunck_start);
+	
+	// write tlb?????????? no need because it will be written when next time fault
+	
+	
+	return chunck_start;
+}

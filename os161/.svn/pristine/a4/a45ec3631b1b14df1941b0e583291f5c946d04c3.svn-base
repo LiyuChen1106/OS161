@@ -1,0 +1,494 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <thread.h>
+#include <curthread.h>
+#include <addrspace.h>
+#include <vm.h>
+#include <synch.h>
+#include <machine/spl.h>
+#include <machine/tlb.h>
+#include <machine/trapframe.h>
+#include <machine/vm.h>
+
+/*
+ * Following functions are all modified from dumbvm.c
+ */
+
+
+int vm_init = 0;
+
+paddr_t coremap_startpaddr, coremap_endpaddr;
+
+
+void
+vm_bootstrap(void)
+{
+	paddr_t firstpaddr_temp, lastpaddr_temp;
+
+	ram_getsize(&firstpaddr_temp, &lastpaddr_temp);
+
+	// determine the size of coremap
+	unsigned long coremap_entry_num;
+	coremap = (struct coremap_entry*)PADDR_TO_KVADDR(firstpaddr_temp);
+
+	page_num = (lastpaddr_temp - firstpaddr_temp) / PAGE_SIZE;
+	coremap_startpaddr = firstpaddr_temp;
+	coremap_endpaddr = firstpaddr_temp + page_num * sizeof(struct coremap_entry);
+	coremap_entry_num = ROUNDUP((coremap_endpaddr - firstpaddr_temp), PAGE_SIZE) / PAGE_SIZE;
+
+	// initial setup of the coremap
+	unsigned long i = 0;
+	for( ; i<page_num; i++){
+		
+		if(i<coremap_entry_num){
+			
+			coremap[i].ppage_state = 0;
+			coremap[i].link = 1;
+			coremap[i].paddr = firstpaddr_temp + i * PAGE_SIZE;
+			coremap[i].vaddr = PADDR_TO_KVADDR(coremap[i].paddr);
+		}
+		else {
+		
+			coremap[i].ppage_state = 1;
+			coremap[i].link = 0;
+			
+			//check correctness??
+			coremap[i].paddr = firstpaddr_temp + i * PAGE_SIZE;
+			coremap[i].startpaddr = 0;
+			coremap[i].as = NULL;
+			coremap[i].chunck_size = 0;
+		}
+
+	}
+
+	coremap_lock = lock_create("coremap lock");
+
+	vm_init = 1;
+
+}
+
+paddr_t
+getppages(unsigned long npages, int is_kernel)
+{
+
+	paddr_t addr;
+
+	if(!vm_init){
+	
+		addr = ram_stealmem(npages);
+		return addr;
+	} else {
+
+		// get the next available n physical pages: currently without swap
+		unsigned long count = 0;
+		unsigned long chunck_start;
+
+
+		unsigned long i = 0;
+	
+		lock_acquire(coremap_lock);
+		for( ; i < page_num; i++) {
+
+			// get the first free page
+			if(coremap[i].ppage_state != 1){
+	
+				chunck_start = i+1;
+				count = 0;
+				continue;
+			}
+	
+			count++;
+			
+			if(count == npages)
+				break;		
+		}
+	
+		// may want to change this when implementing swapping
+		// right now, if no available pages, return 0
+		if(i == page_num){
+
+			lock_release(coremap_lock);
+			return 0;
+		}
+
+		addr = coremap[chunck_start].paddr;
+		// how to synch with PT???
+		// set mapping in the coremap
+		for(i = chunck_start; i < chunck_start + npages; i++){
+
+			coremap[i].as = curthread->t_vmspace;//check??? && when to store the vaddr?
+			coremap[i].link++;
+
+			if(is_kernel)
+				coremap[i].ppage_state = 0;
+			else
+				coremap[i].ppage_state = 2;
+
+			coremap[i].chunck_size = npages;
+			coremap[i].startpaddr = addr;
+			//coremap[i].paddr = coremap[i].startpaddr + (i - chunck_start) * PAGE_SIZE;
+		}
+
+
+		lock_release(coremap_lock);
+	}
+
+	return addr;
+
+}
+
+/* Allocate/free some kernel-space virtual pages */
+vaddr_t 
+alloc_kpages(int npages)
+{
+	paddr_t pa;
+	pa = getppages(npages, 1);
+	if (pa==0) {
+		return 0;
+	}
+	return PADDR_TO_KVADDR(pa);
+}
+
+paddr_t 
+alloc_upages(int npages)
+{
+	paddr_t pa;
+	pa = getppages(npages, 0);
+	if (pa==0) {
+		return 0;
+	}
+	return pa;
+}
+
+
+void 
+free_kpages(vaddr_t addr)
+{
+
+	unsigned long i = 0;
+	int npage_to_free;
+
+	// find the corresponding ppage in coremap
+	lock_acquire(coremap_lock);
+	
+	for( ; i < page_num; i++){
+
+		if(PADDR_TO_KVADDR(coremap[i].paddr) == addr){//how to translate vaddr???
+
+			npage_to_free = coremap[i].chunck_size;
+			break;
+		}
+	}
+
+	//if(i == page_num)
+		//???
+	// not sure: if free one of the pages in the chunck
+	// how to synch with PT???
+	if(coremap[i].paddr == coremap[i].startpaddr){
+
+		unsigned long j;
+		for(j = i; j < i + npage_to_free; j++){
+
+			coremap[j].as = NULL;
+			coremap[j].startpaddr = 0;
+			coremap[j].ppage_state = 1;
+			coremap[j].chunck_size = 0;
+		}
+
+	} else {
+
+		coremap[i].as = NULL;
+		coremap[i].startpaddr = 0;
+		coremap[i].ppage_state = 1;
+		coremap[i].chunck_size = 0;
+	}
+
+	lock_release(coremap_lock);
+}
+
+void free_upages(paddr_t addr){
+
+	lock_acquire(coremap_lock);
+
+	int index = (addr-coremap_startpaddr) / PAGE_SIZE;
+	assert(addr == coremap[index].paddr);
+	assert(coremap[index].chunck_size == 1);
+
+	coremap[index].link--;
+	assert(coremap[index].link >= 0);
+
+	if(coremap[index].link == 0){
+
+		// if copy-on-write, how to keep track of remaining as??????
+		coremap[index].as = NULL;
+		coremap[index].startpaddr = 0;
+		coremap[index].ppage_state = 1;
+	}
+
+	lock_release(coremap_lock);
+}
+
+int
+vm_fault(int faulttype, vaddr_t faultaddress)
+{
+	vaddr_t vbase1, vtop1, vbase2, vtop2;
+	vaddr_t stackbase, stacktop, heapbase, heaptop;
+
+	int result;
+
+
+	struct addrspace *as;
+	int spl;
+
+	spl = splhigh();
+
+	faultaddress &= PAGE_FRAME;
+
+	//DEBUG(DB_VM, "dumbvm: fault: 0x%x\n", faultaddress);
+
+	switch (faulttype) {
+	    case VM_FAULT_READONLY:
+		/* We always create pages read-write, so we can't get this */
+		    //comment out if implementing copy-on-write
+		panic("dumbvm: got VM_FAULT_READONLY\n");
+	    case VM_FAULT_READ:
+	    case VM_FAULT_WRITE:
+		break;
+	    default:
+		splx(spl);
+		return EINVAL;
+	}
+
+	as = curthread->t_vmspace;
+	if (as == NULL) {
+		/*
+		 * No address space set up. This is probably a kernel
+		 * fault early in boot. Return EFAULT so as to panic
+		 * instead of getting into an infinite faulting loop.
+		 */
+		return EFAULT;
+	}
+
+	/* Assert that the address space has been set up properly. */
+	assert(as->as_vbase1 != 0);
+	assert(as->as_npages1 != 0);
+	assert(as->as_vbase2 != 0);
+	assert(as->as_npages2 != 0);
+	//assert(as->as_stackbase != 0);
+
+
+
+	assert((as->as_vbase1 & PAGE_FRAME) == as->as_vbase1);
+	assert((as->as_vbase2 & PAGE_FRAME) == as->as_vbase2);
+	//assert((as->as_stackbase & PAGE_FRAME) == as->as_stackbase);
+
+	vbase1 = as->as_vbase1;
+	vtop1 = vbase1 + as->as_npages1 * PAGE_SIZE;
+	vbase2 = as->as_vbase2;
+	vtop2 = vbase2 + as->as_npages2 * PAGE_SIZE;
+	// if has limitation for stack, let statckbase be the smallest possible addr
+	stackbase = USERSTACK - STACK_MAX * PAGE_SIZE;
+	stacktop = USERSTACK;
+	heapbase = as->as_heap_start;
+	heaptop = as->as_heap_end;
+
+	if (faultaddress >= vbase1 && faultaddress < vtop1) {
+
+		result = check_vaddr(faulttype, faultaddress, as, as->as_region_permission1);
+		splx(spl);
+		return result;
+	}
+	else if (faultaddress >= vbase2 && faultaddress < vtop2) {
+
+		result = check_vaddr(faulttype, faultaddress, as, as->as_region_permission2);
+		splx(spl);
+		return result;
+	}
+	else if (faultaddress >= stackbase && faultaddress < stacktop) {
+		
+		result = check_vaddr(faulttype, faultaddress, as, 0);
+		splx(spl);
+		return result;
+	}
+	else if (faultaddress >= heapbase && faultaddress < heaptop) {
+
+		// write to heap should not go through vm fault
+		if(faulttype == VM_FAULT_WRITE){
+			splx(spl);
+			return EFAULT;
+		}
+
+		result = check_vaddr(faulttype, faultaddress, as, 0);
+		splx(spl);
+		return result;
+	}
+	else {
+		splx(spl);
+		return EFAULT;
+	}
+
+}
+
+paddr_t page_fault_handler(vaddr_t faultaddress, struct addrspace *as, int permission)
+{
+
+	int first_index = (faultaddress & FIRST_LEVEL_VPN) >> 22; 
+	int second_index = (faultaddress & SECOND_LEVEL_VPN) >> 12;
+
+
+	struct page_table_entry *second_PT = as->two_level_PT[first_index];
+
+	// request a ppage 
+	paddr_t paddr = alloc_upages(1);
+
+	// if cannot alloc more pages, swapping
+	//if(paddr == 0)
+
+	// set mapping in page table
+	second_PT[second_index].addr = paddr & PAGE_FRAME;
+	second_PT[second_index].valid = 1;
+	second_PT[second_index].writeable = 1;
+			
+
+	return (paddr & PAGE_FRAME);
+}
+
+/* Check validity of the vaddr
+ * 1. if exist in page table, load into TLB
+ * 2. if triger a page fault, allocate physical page for it and set mapping in PT and TLB
+ * 3. if no space in physical mem, swap and then set mapping in coremap, PT and TLB
+ *
+ * 2 and 3 is implemented in page_fault_handler
+ *
+ * the swapping is not implemented until part 3
+ */
+int check_vaddr(int faulttype, vaddr_t faultaddress, struct addrspace *as, int permission) 
+{
+
+	int first_index = (faultaddress & FIRST_LEVEL_VPN) >> 22; 
+	int second_index = (faultaddress & SECOND_LEVEL_VPN) >> 12;
+
+	paddr_t paddr;
+
+	int i;
+	u_int32_t ehi, elo;
+
+	int pte_writeable;
+	struct page_table_entry *second_PT = as->two_level_PT[first_index];
+
+	// the address for read must be valid
+	if(faulttype == VM_FAULT_READ){
+		if(second_PT == NULL || second_PT[second_index].valid == 0)
+			return EFAULT;
+
+		paddr = (paddr_t) second_PT[second_index].addr;
+		pte_writeable = second_PT[second_index].writeable;
+
+	}
+	// the first level page table should be allocated when as_copy, all NULL and valid bit to 0
+	// for writing to the address that is invalid in TLB
+	else if(faulttype == VM_FAULT_WRITE) {
+
+		// second level page table does not exist, allocate one
+		if(second_PT == NULL){
+
+			second_PT = (struct page_table_entry *)kmalloc(PT_SIZE * sizeof(struct page_table_entry));
+
+			// invalidate all entries
+			for(i = 0; i < PT_SIZE; i++)
+				second_PT[i].valid = 0;
+
+			as->two_level_PT[first_index] = second_PT;
+
+			
+			paddr = page_fault_handler(faultaddress, as, permission);
+			pte_writeable = 1;
+			
+		}
+		// if there is no mapping in existing page table
+		else if(second_PT[second_index].valid == 0){
+
+			paddr = page_fault_handler(faultaddress, as, permission);
+			pte_writeable = 1;
+
+		}
+		// if the mapping is in the page table
+		else if(second_PT[second_index].writeable == 0){
+
+			// copy-on-write, coremap link decrease
+			paddr_t old_paddr;
+			old_paddr = (paddr_t) second_PT[second_index].addr;
+			 
+
+			int index = (old_paddr-coremap_startpaddr) / PAGE_SIZE;
+
+			assert(old_paddr == coremap[index].paddr);
+			coremap[index].link--;
+
+			paddr = page_fault_handler(faultaddress, as, permission);
+			pte_writeable = 1;
+
+		}
+		else {
+							
+			paddr = (paddr_t) second_PT[second_index].addr;
+			pte_writeable = second_PT[second_index].writeable;
+
+		}
+
+	}
+	// writing to readonly address
+	else {
+		
+		// copy-on-write, coremap link decrease
+		paddr_t old_paddr;
+		old_paddr = (paddr_t) second_PT[second_index].addr;
+		 
+
+		int index = (old_paddr-coremap_startpaddr) / PAGE_SIZE;
+
+		assert(old_paddr == coremap[index].paddr);
+		coremap[index].link--;
+
+
+		paddr = page_fault_handler(faultaddress, as, permission);
+		pte_writeable = 1;
+
+	}
+
+
+	/* make sure it's page-aligned */
+	faultaddress &= PAGE_FRAME;
+	assert((paddr & PAGE_FRAME)==paddr);
+
+	for (i=0; i<NUM_TLB; i++) {
+		TLB_Read(&ehi, &elo, i);
+		if (elo & TLBLO_VALID) {
+			continue;
+		}
+		ehi = faultaddress;
+
+		if(pte_writeable)
+			elo = paddr | TLBLO_DIRTY | TLBLO_VALID;
+		//else
+		//	elo = paddr | 0 | TLBLO_VALID;
+		
+		DEBUG(DB_VM, "dumbvm: 0x%x -> 0x%x\n", faultaddress, paddr);
+		TLB_Write(ehi, elo, i);
+		return 0;
+	}
+
+	//kprintf("dumbvm: Ran out of TLB entries - cannot handle page fault\n");
+
+	ehi = faultaddress;
+	if(pte_writeable)	
+		elo = paddr | TLBLO_DIRTY | TLBLO_VALID;	
+	//else
+	//	elo = paddr | 0 | TLBLO_VALID;
+	
+	TLB_Random(ehi, elo);
+	return 0;
+
+}
+

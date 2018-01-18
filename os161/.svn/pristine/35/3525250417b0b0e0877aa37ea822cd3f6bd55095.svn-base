@@ -1,0 +1,64 @@
+#ifndef _VM_H_
+#define _VM_H_
+
+#include <machine/vm.h>
+
+/*
+ * VM system-related definitions.
+ *
+ * You'll probably want to add stuff here.
+ */
+
+
+/* Fault-type arguments to vm_fault() */
+#define VM_FAULT_READ        0    /* A read was attempted */
+#define VM_FAULT_WRITE       1    /* A write was attempted */
+#define VM_FAULT_READONLY    2    /* A write to a readonly page was attempted*/
+
+/* Coremap entry structure */
+struct  coremap_entry{
+
+	// the virtual addr and its addrspace that this physical page is mapped to
+	struct addrspace *as;
+	vaddr_t vaddr;
+	paddr_t paddr;
+	paddr_t startpaddr;
+
+	// the page state 
+	/*
+	 * 0: fixed by kernel
+	 * 1: free
+	 * 2: pinned to memory?? needed??
+	 * 3: dirty
+	 * 4: clean
+	 */
+	int ppage_state;	
+
+	// the chunck size
+	int chunck_size;
+
+	// other info must be added when implementing the swapping algo
+	
+};
+
+/* Coremap: 
+ * keep track of all the physical pages
+ */
+struct coremap_entry *coremap;
+
+struct lock *coremap_lock;
+
+/* Initialization function */
+void vm_bootstrap(void);
+
+/* Fault handling function called by trap code */
+int vm_fault(int faulttype, vaddr_t faultaddress);
+
+/* Allocate/free kernel heap pages (called by kmalloc/kfree) */
+vaddr_t alloc_kpages(int npages);
+void free_kpages(vaddr_t addr);
+
+// get pages
+paddr_t getppages(unsigned long npages);
+
+#endif /* _VM_H_ */

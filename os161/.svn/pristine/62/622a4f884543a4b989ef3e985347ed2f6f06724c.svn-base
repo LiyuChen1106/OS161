@@ -1,0 +1,42 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <machine/pcb.h>
+#include <machine/spl.h>
+#include <machine/trapframe.h>
+#include <kern/callno.h>
+#include <syscall.h>
+#include <kern/unistd.h>
+#include <thread.h>
+#include <curthread.h>
+#include <addrspace.h>
+#include <vm.h>
+#include <lib.h>
+
+
+int sys__time(time_t *seconds, unsigned long *nanoseconds){
+    // local copy of seconds and nanoseconds
+    time_t local_seconds;
+    unsigned long local_nanoseconds;
+    int result = 0;
+    
+    // get the time from the kernel
+    gettime(&local_seconds, &local_nanoseconds);
+    kprintf("got time: %d seconds, %d nanoseconds \n", local_seconds, local_nanoseconds);
+    
+    // copy out to the user space
+    result = copyout(&local_seconds, seconds, sizeof(local_seconds));
+    if(result)
+        return result;
+    
+    kprintf("copied out time: %d seconds\n", *seconds);
+    
+    // copy out to the user space
+    result = copyout(&local_nanoseconds, nanoseconds,sizeof(local_nanoseconds));
+    if(result)
+        return result;
+    
+    kprintf("copied out time: %d seconds, %d nanoseconds \n", *seconds, *nanoseconds);
+    
+    return 0;
+}
